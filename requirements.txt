@@ -3,3 +3,4 @@ scikit-learn
 fredapi
 numpy
 pandas
+joblib
