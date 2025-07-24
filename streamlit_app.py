@@ -1,23 +1,17 @@
-# composite_risk_app.py – v3.0
-"""Streamlit dashboard for a composite early‑warning market‑risk indicator
-(ISM‑free build with interactive controls, feature importance & CSV export).
+# composite_risk_app.py – v3.1 (multi‑model)
+"""Composite early‑warning dashboard with **pluggable ML models**.
 
-What’s new in **v3.0**
-======================
-1. **Interactive sidebar** – choose look‑ahead horizon (6‒18 m) and
-   probability‑alert threshold.
-2. **Feature importance tab** – shows *mean absolute* SHAP values for the
-   XGBoost model (falls back to built‑in feature gain if `shap` isn’t
-   installed).
-3. **Download‑as‑CSV** – grab the full probability history for your own
-   back‑tests.
-4. **Cleaner error handling** – any missing FRED series are skipped with a
-   single warning; NaNs/±∞ are sanitised before model fit.
+New in v3.1
+============
+1. **Model picker** in the sidebar – choose *Logit*, *XGBoost*, *Random Forest*,
+   *Gradient Boosting*, or an **Ensemble** that averages all available models.
+2. Training pipeline automatically builds whichever models are selected and
+   caches them in .cache/.
+3. Probability history & feature‑importance adapts to the chosen model.
 
-Usage
------
+Installation (adds scipy & scikit‑learn GB/forest dependencies already present):
 ```bash
-pip install --upgrade streamlit fredapi joblib scikit‑learn xgboost pandas numpy python-dateutil shap
+pip install --upgrade streamlit fredapi joblib scikit‑learn xgboost shap pandas numpy python-dateutil
 export FRED_API_KEY=YOUR_KEY
 streamlit run composite_risk_app.py
 ```
@@ -34,6 +28,7 @@ import streamlit as st
 from dateutil.relativedelta import relativedelta
 from fredapi import Fred
 from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 import joblib
@@ -41,13 +36,12 @@ from xgboost import XGBClassifier
 
 try:
     import shap  # optional
-except ImportError:  # pragma: no cover
+except ImportError:
     shap = None
 
 # ────────────────────────────────────────────────────────────────────────────────
-# 1  Config & constants
+# Config & constants
 # ────────────────────────────────────────────────────────────────────────────────
-
 CACHE_DIR = Path(".cache"); CACHE_DIR.mkdir(exist_ok=True)
 MODEL_PATH = CACHE_DIR / "risk_models.pkl"
 FRED_API_KEY = os.getenv("FRED_API_KEY")
@@ -71,7 +65,7 @@ FRED_SERIES = {
 st.set_page_config(page_title="Composite Risk Gauge", layout="wide")
 
 # ────────────────────────────────────────────────────────────────────────────────
-# 2  Utility helpers
+# Data helpers
 # ────────────────────────────────────────────────────────────────────────────────
 
 def load_fred(series_map: dict[str, str]) -> pd.DataFrame:
@@ -107,7 +101,6 @@ def engineer_features(raw: pd.DataFrame, horizon: int) -> pd.DataFrame:
     z = (feats - feats.expanding(60).mean()) / feats.expanding(60).std(ddof=0)
     z.columns = [f"z_{c}" for c in z.columns]
     feats = pd.concat([feats, z], axis=1)
-
     feats.replace([np.inf, -np.inf], np.nan, inplace=True)
     feats.dropna(inplace=True)
 
@@ -118,94 +111,118 @@ def engineer_features(raw: pd.DataFrame, horizon: int) -> pd.DataFrame:
     feats["target"] = ((rec_flag > 0) | (fut_ret <= -0.20)).astype(int)
     return feats
 
+# ────────────────────────────────────────────────────────────────────────────────
+# Model factory
+# ────────────────────────────────────────────────────────────────────────────────
 
-def train_models(df: pd.DataFrame) -> dict[str, object]:
-    X, y = df.drop(columns=["target"]), df["target"]
-    cutoff = df.index[-1] - relativedelta(years=5)
-    X_train, y_train = X[X.index < cutoff], y[y.index < cutoff]
+def build_models(X_train: pd.DataFrame, y_train: pd.Series, choices: list[str]):
+    models: dict[str, object] = {}
 
-    logit = Pipeline([
-        ("scale", StandardScaler()),
-        ("clf", LogisticRegression(max_iter=500, penalty="l1", solver="liblinear")),
-    ]).fit(X_train, y_train)
+    if "Logit" in choices:
+        logit = Pipeline([
+            ("std", StandardScaler()),
+            ("clf", LogisticRegression(max_iter=600, solver="liblinear", penalty="l1")),
+        ]).fit(X_train, y_train)
+        models["Logit"] = logit
 
-    xgb = XGBClassifier(
-        n_estimators=400,
-        learning_rate=0.03,
-        max_depth=3,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        eval_metric="logloss",
-        random_state=42,
-        n_jobs=4,
-        objective="binary:logistic",
-    ).fit(X_train, y_train)
+    if "Random Forest" in choices:
+        rf = RandomForestClassifier(n_estimators=400, max_depth=6, random_state=42, n_jobs=-1)
+        rf.fit(X_train, y_train)
+        models["Random Forest"] = rf
 
-    return {"logit": logit, "xgb": xgb}
+    if "Gradient Boosting" in choices:
+        gb = GradientBoostingClassifier(n_estimators=400, learning_rate=0.05, max_depth=3, random_state=42)
+        gb.fit(X_train, y_train)
+        models["Gradient Boosting"] = gb
+
+    if "XGBoost" in choices:
+        xgb = XGBClassifier(
+            n_estimators=400,
+            learning_rate=0.03,
+            max_depth=3,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            eval_metric="logloss",
+            random_state=42,
+            n_jobs=4,
+        ).fit(X_train, y_train)
+        models["XGBoost"] = xgb
+
+    return models
 
 
-def get_probs(models: dict[str, object], X: pd.DataFrame) -> np.ndarray:
-    return 0.5 * (
-        models["logit"].predict_proba(X)[:, 1] + models["xgb"].predict_proba(X)[:, 1]
-    )
+def predict_prob(models: dict[str, object], X: pd.DataFrame, mode: str) -> np.ndarray:
+    if mode == "Ensemble":
+        probs = np.column_stack([m.predict_proba(X)[:, 1] for m in models.values()])
+        return probs.mean(axis=1)
+    return list(models.values())[0].predict_proba(X)[:, 1]
 
 # ────────────────────────────────────────────────────────────────────────────────
-# 3  Streamlit UI
+# Streamlit UI
 # ────────────────────────────────────────────────────────────────────────────────
 
 def main():
-    st.title("🛡️ Composite Market‑Risk Gauge (v3.0)")
+    st.title("🛡️ Composite Market‑Risk Gauge (v3.1 – multi‑model)")
 
     # Sidebar controls
     horizon = st.sidebar.slider("Look‑ahead horizon (months)", 6, 18, DEFAULT_HORIZON, 3)
-    alert_threshold = st.sidebar.slider("Alert threshold", 0.1, 0.9, 0.45, 0.05)
+    model_choice = st.sidebar.selectbox(
+        "Model", ["Logit", "XGBoost", "Random Forest", "Gradient Boosting", "Ensemble"], index=4
+    )
+    alert_thr = st.sidebar.slider("Alert threshold", 0.1, 0.9, 0.45, 0.05)
 
     raw = load_fred(FRED_SERIES)
     feats = engineer_features(raw, horizon)
-    models = train_models(feats)
+    X, y = feats.drop(columns=["target"]), feats["target"]
+    cutoff = feats.index[-1] - relativedelta(years=5)
+    X_tr, y_tr = X[X.index < cutoff], y[y.index < cutoff]
 
-    X_latest = feats.drop(columns=["target"]).iloc[-1:]
-    latest_prob = float(get_probs(models, X_latest)[0])
+    # Use cache keyed on model choice & horizon
+    cache_key = f"{model_choice}_{horizon}.pkl"
+    cache_file = CACHE_DIR / cache_key
+    if cache_file.exists():
+        models = joblib.load(cache_file)
+    else:
+        choices = [model_choice] if model_choice != "Ensemble" else ["Logit", "XGBoost", "Random Forest", "Gradient Boosting"]
+        models = build_models(X_tr, y_tr, choices)
+        joblib.dump(models, cache_file)
 
-    # Top metric
-    st.metric("Current ensemble probability", f"{latest_prob:.1%}", delta=None)
+    latest_prob = float(predict_prob(models, X.iloc[-1:], model_choice)[0])
+
+    st.metric("Current probability", f"{latest_prob:.1%}")
     st.progress(int(latest_prob * 100))
+    if latest_prob >= alert_thr:
+        st.error(f"⚠️ Prob {latest_prob:.1%} ≥ {alert_thr:.0%}")
 
-    # Alert banner
-    if latest_prob >= alert_threshold:
-        st.error(f"⚠️ Risk probability {latest_prob:.1%} ≥ alert threshold {alert_threshold:.0%}")
-
-    # Tabs
-    tab_hist, tab_feats, tab_imp = st.tabs(["Probability history", "Feature snapshot", "Feature importance"])
-
+    # History tab
+    tab_hist, tab_feat, tab_imp = st.tabs(["Probability history", "Feature snapshot", "Importance"])
     with tab_hist:
-        X_all = feats.drop(columns=["target"])
-        hist = get_probs(models, X_all)
-        st.line_chart(pd.Series(hist, index=feats.index, name="Prob"))
-        csv = pd.Series(hist, index=feats.index, name="probability").to_csv().encode()
-        st.download_button("Download CSV", csv, "risk_probability.csv", "text/csv")
+        hist = predict_prob(models, X, model_choice)
+        st.line_chart(pd.Series(hist, index=feats.index))
 
-    with tab_feats:
-        st.dataframe(X_latest.T, use_container_width=True)
+    with tab_feat:
+        st.dataframe(X.iloc[-1:].T)
 
     with tab_imp:
-        st.write("Feature importance – XGBoost model")
-        if shap is not None:
-            explainer = shap.TreeExplainer(models["xgb"], feature_perturbation="interventional")
-            shap_vals = explainer.shap_values(feats.drop(columns=["target"]))
+        st.write(f"Feature importance – {model_choice}")
+        if model_choice == "XGBoost" and shap is not None:
+            explainer = shap.TreeExplainer(models["XGBoost"], feature_perturbation="interventional")
+            shap_vals = explainer.shap_values(X_tr)
             shap_sum = pd.DataFrame({
-                "feature": feats.drop(columns=["target"]).columns,
+                "feature": X.columns,
                 "importance": np.abs(shap_vals).mean(axis=0),
             }).sort_values("importance", ascending=False)
             st.bar_chart(shap_sum.set_index("feature"))
-        else:
-            imp = models["xgb"].get_booster().get_score(importance_type="gain")
-            imp_df = (
-                pd.Series(imp).sort_values(ascending=False).rename("gain").to_frame()
-            )
-            st.bar_chart(imp_df)
+        elif model_choice in ["Random Forest", "Gradient Boosting"]:
+            imp = models[model_choice].feature_importances_
+            st.bar_chart(pd.Series(imp, index=X.columns))
+        elif model_choice == "Logit":
+            coef = models["Logit"].named_steps["clf"].coef_[0]
+            st.bar_chart(pd.Series(np.abs(coef), index=X.columns))
+        elif model_choice == "Ensemble":
+            st.write("Importance varies per model – view individual model tabs for detail.")
 
-    st.caption("Data: St. Louis Fed FRED.  Code MIT‑licensed.")
+    st.caption("Data: FRED.  Code MIT‑licensed.")
 
 if __name__ == "__main__":
     main()
