@@ -1,22 +1,24 @@
-# composite_risk_app.py
-"""Streamlit dashboard for a composite early‑warning market‑risk indicator.
+# composite_risk_app.py – v2
+"""Streamlit dashboard for a composite early‑warning market‑risk indicator (enhanced).
 
-The app pulls fresh macro/market data from FRED, engineers features, trains (or
-loads) a logistic‑regression‑based ensemble, and outputs a 12‑month recession /
-20%‑draw‑down probability.  Replace or augment the model with XGBoost for
-non‑linear lift if desired.
+Adds:
+    • Short‑leading indicators: Philly Fed Leading Index (USSLIND), Chicago Fed
+      NFCI / Adjusted‑NFCI, ISM New Orders – Inventories spread.
+    • Gradient‑Boosted Trees (XGBoost) ensemble with the original L1‑Logit.
+    • Ensemble probability (mean of the two models) plotted & displayed.
 
 Run with:
+    pip install streamlit fredapi joblib scikit‑learn xgboost pandas numpy python-dateutil
+    export FRED_API_KEY=YOUR_KEY
     streamlit run composite_risk_app.py
 
-Environment variables required:
-    FRED_API_KEY  – get yours free at https://fred.stlouisfed.org/docs/api/api_key.html
+Environment:
+    FRED_API_KEY – get yours at <https://fred.stlouisfed.org>
 """
-
 from __future__ import annotations
 
 import os
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -29,37 +31,45 @@ from sklearn.metrics import roc_auc_score
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 import joblib
+from xgboost import XGBClassifier
 
-# -----------------------------------------------------------------------------
-# 1. Configuration & constants
-# -----------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────────────────
+# 1  Config & constants
+# ────────────────────────────────────────────────────────────────────────────────
 
 CACHE_DIR = Path(".cache")
 CACHE_DIR.mkdir(exist_ok=True)
-
-MODEL_PATH = CACHE_DIR / "risk_model.pkl"
+MODEL_PATH = CACHE_DIR / "risk_models.pkl"
 FRED_API_KEY = os.getenv("FRED_API_KEY")
 START_DATE = "1960-01-01"
 EVENT_HORIZON_MONTHS = 12  # 12‑month look‑ahead window
 
+# Base & new series pulled from FRED
 FRED_SERIES = {
+    # Term‑structure & credit
     "DGS10": "10‑Year Treasury Constant Maturity Rate",
     "TB3MS": "3‑Month Treasury Bill Secondary Market Rate",
     "BAA10YM": "Moody's Seasoned Baa Corporate Bond Yield",
     "AAA10YM": "Moody's Seasoned Aaa Corporate Bond Yield",
+    # Labor & vol
     "UNRATE": "Unemployment Rate",
-    "CIVPART": "Labor Force Participation Rate",
-    "VIXCLS": "CBOE VIX Close",
+    "VIXCLS": "CBOE VIX Close",
+    # Recession flag & equity index
     "USRECD": "NBER Recession Indicator",
-    "SP500": "S&P 500 Index (Daily Close)",
-    # Add additional series here as desired
+    "SP500": "S&P 500 Index (Daily Close)",
+    # NEW Short‑leading & financial‑conditions
+    "USSLIND": "Philly Fed Leading Index",
+    "NFCI": "Chicago Fed NFCI",
+    "ANFCI": "Chicago Fed Adjusted NFCI",
+    "NAPMNOI": "ISM New Orders Index",       # Manufacturing New Orders
+    "NAPMII": "ISM Inventories Index",       # Manufacturing Inventories
 }
 
 st.set_page_config(page_title="Composite Risk Gauge", layout="wide")
 
-# -----------------------------------------------------------------------------
-# 2. Data loading helpers
-# -----------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────────────────
+# 2  Data loading helpers
+# ────────────────────────────────────────────────────────────────────────────────
 
 @st.cache_data(show_spinner="Downloading data from FRED…", ttl=43200)
 def load_fred(series: dict[str, str], start: str = START_DATE) -> pd.DataFrame:
@@ -79,113 +89,154 @@ def compute_baa_aaa_spread(df: pd.DataFrame) -> pd.Series:
     return df["Moody's Seasoned Baa Corporate Bond Yield"] - df["Moody's Seasoned Aaa Corporate Bond Yield"]
 
 
-@st.cache_data(show_spinner="Fetching and engineering data…", ttl=43200)
+@st.cache_data(show_spinner="Engineering features…", ttl=43200)
 def build_feature_table() -> pd.DataFrame:
     raw = load_fred(FRED_SERIES)
 
-    features = pd.DataFrame(index=raw.index)
-    features["term_spread"] = compute_term_spread(raw)
-    features["credit_spread"] = compute_baa_aaa_spread(raw)
-    features["vix"] = raw["CBOE VIX Close"].fillna(method="ffill")
-    # Sahm Rule ΔU
+    # Forward‑fill for missing monthly observations (esp. VIX prior to 1990)
+    raw = raw.ffill()
+
+    feats = pd.DataFrame(index=raw.index)
+    feats["term_spread"] = compute_term_spread(raw)
+    feats["credit_spread"] = compute_baa_aaa_spread(raw)
+    feats["vix"] = raw["CBOE VIX Close"]
+
+    # Sahm rule ΔU
     rolling_min_u = raw["Unemployment Rate"].rolling(window=12, min_periods=1).min()
-    features["sahm_rule"] = raw["Unemployment Rate"] - rolling_min_u
+    feats["sahm_rule"] = raw["Unemployment Rate"] - rolling_min_u
 
-    # Momentum terms (6‑month change)
-    for col in ["term_spread", "credit_spread", "vix", "sahm_rule"]:
-        features[f"{col}_chg6"] = features[col] - features[col].shift(6)
+    # NEW indicators
+    feats["lei_6m_pct"] = raw["Philly Fed Leading Index"].pct_change(6)
+    feats["nfci"] = raw["Chicago Fed NFCI"]
+    feats["an_fci"] = raw["Chicago Fed Adjusted NFCI"]
+    feats["ism_spread"] = raw["ISM New Orders Index"] - raw["ISM Inventories Index"]
 
-    # Simple levels standardization (z‑score w/ expanding window to avoid look‑ahead)
-    z = (features - features.expanding(min_periods=60).mean()) / (
-        features.expanding(min_periods=60).std(ddof=0)
+    # Momentum (6‑month change) for selected cols
+    momentum_cols = [
+        "term_spread",
+        "credit_spread",
+        "vix",
+        "sahm_rule",
+        "lei_6m_pct",
+        "nfci",
+        "ism_spread",
+    ]
+    for col in momentum_cols:
+        feats[f"{col}_chg6"] = feats[col] - feats[col].shift(6)
+
+    # Z‑scores with expanding window (avoid look‑ahead)
+    z = (feats - feats.expanding(min_periods=60).mean()) / (
+        feats.expanding(min_periods=60).std(ddof=0)
     )
     z.columns = [f"z_{c}" for c in z.columns]
-    features = pd.concat([features, z], axis=1).dropna()
 
-    # Target variable y_t: 1 if recession OR 20% draw‑down over next 12 m
-    future_window = raw["S&P 500 Index (Daily Close)"].resample("M").last()
-    future_returns = future_window.pct_change(EVENT_HORIZON_MONTHS)
+    feats = pd.concat([feats, z], axis=1).dropna()
+
+    # Target variable
+    future_sp = raw["S&P 500 Index (Daily Close)"].resample("M").last()
+    future_returns = future_sp.pct_change(EVENT_HORIZON_MONTHS)
     recession_forward = raw["NBER Recession Indicator"].shift(-EVENT_HORIZON_MONTHS).rolling(
         EVENT_HORIZON_MONTHS
     ).max()
     y = ((recession_forward > 0) | (future_returns <= -0.20)).astype(int)
-    features["target"] = y
+    feats["target"] = y
 
-    return features.dropna()
+    return feats.dropna()
 
-# -----------------------------------------------------------------------------
-# 3. Model training & evaluation
-# -----------------------------------------------------------------------------
+# ────────────────────────────────────────────────────────────────────────────────
+# 3  Model training & caching
+# ────────────────────────────────────────────────────────────────────────────────
 
 @st.cache_data(show_spinner=False)
-def train_or_load_model(df: pd.DataFrame) -> Pipeline:
+def train_or_load_models(df: pd.DataFrame):
+    """Returns a dict with 'logit' and 'xgb' models."""
     if MODEL_PATH.exists():
         return joblib.load(MODEL_PATH)
 
     X = df.drop(columns=["target"])
     y = df["target"]
 
-    train_cutoff = datetime.utcnow() - relativedelta(years=5)  # keep last 5 yrs for out‑of‑sample
+    train_cutoff = datetime.utcnow() - relativedelta(years=5)  # keep 5 yrs OOS
     X_train = X[X.index < train_cutoff]
     y_train = y[y.index < train_cutoff]
 
-    # Simple, interpretable pipeline
-    pipe = Pipeline([
+    # Logistic regression (interpretable baseline)
+    logit_pipe = Pipeline([
         ("scaler", StandardScaler()),
-        ("clf", LogisticRegression(max_iter=200, penalty="l1", solver="liblinear")),
+        ("clf", LogisticRegression(max_iter=400, penalty="l1", solver="liblinear")),
     ])
-    pipe.fit(X_train, y_train)
+    logit_pipe.fit(X_train, y_train)
 
-    # Evaluate quick AUC
-    auc = roc_auc_score(y_train, pipe.predict_proba(X_train)[:, 1])
-    st.info(f"Model trained (AUC in‑sample ≈ {auc:.2f}).  Saved to {MODEL_PATH}.")
+    # XGBoost classifier (non‑linear lift)
+    xgb_model = XGBClassifier(
+        objective="binary:logistic",
+        n_estimators=350,
+        learning_rate=0.03,
+        max_depth=3,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        eval_metric="logloss",
+        random_state=42,
+        n_jobs=4,
+    )
+    xgb_model.fit(X_train, y_train)
 
-    joblib.dump(pipe, MODEL_PATH)
-    return pipe
+    # Quick in‑sample metrics
+    logit_auc = roc_auc_score(y_train, logit_pipe.predict_proba(X_train)[:, 1])
+    xgb_auc = roc_auc_score(y_train, xgb_model.predict_proba(X_train)[:, 1])
+    st.info(f"Models trained – Logit AUC {logit_auc:.2f} | XGB AUC {xgb_auc:.2f}.  Cached to {MODEL_PATH}.")
 
-# -----------------------------------------------------------------------------
-# 4. Streamlit UI
-# -----------------------------------------------------------------------------
+    models = {"logit": logit_pipe, "xgb": xgb_model}
+    joblib.dump(models, MODEL_PATH)
+    return models
+
+# ────────────────────────────────────────────────────────────────────────────────
+# 4  Streamlit UI
+# ────────────────────────────────────────────────────────────────────────────────
 
 def main():
-    st.title("🛡️  Composite Market‑Risk Gauge")
-    st.caption("Probability that the next 12 months contain an NBER recession **or** ≥ 20 % S&P 500 draw‑down.")
+    st.title("🛡️ Composite Market‑Risk Gauge (v2)")
+    st.caption("Probability that the next 12 months contain an NBER recession **or** ≥ 20 % S&P draw‑down.")
 
-    features = build_feature_table()
-    model = train_or_load_model(features)
+    feats = build_feature_table()
+    models = train_or_load_models(feats)
 
-    X_latest = features.drop(columns=["target"]).iloc[-1:]
-    prob = float(model.predict_proba(X_latest)[0, 1])
+    X_latest = feats.drop(columns=["target"]).iloc[-1:]
+    prob_logit = float(models["logit"].predict_proba(X_latest)[0, 1])
+    prob_xgb = float(models["xgb"].predict_proba(X_latest)[0, 1])
+    prob = 0.5 * (prob_logit + prob_xgb)
 
-    st.metric("Current risk probability", f"{prob:.1%}")
-
-    # Gauge ‑ simple visual with st.progress
+    st.metric("Current ensemble probability", f"{prob:.1%}")
     st.progress(min(int(prob * 100), 100))
 
-    st.subheader("Historical back‑test")
-    hist_probs = pd.Series(
-        model.predict_proba(features.drop(columns=["target"]))[:, 1], index=features.index
+    # Historical ensemble
+    X_all = feats.drop(columns=["target"])
+    hist_prob = 0.5 * (
+        models["logit"].predict_proba(X_all)[:, 1] + models["xgb"].predict_proba(X_all)[:, 1]
     )
-    st.line_chart(hist_probs.rename("Risk probability"))
+    st.subheader("Historical back‑test (ensemble)")
+    st.line_chart(pd.Series(hist_prob, index=feats.index, name="Ensemble risk prob"))
 
-    st.subheader("Feature values – latest snapshot")
-    st.dataframe(X_latest.T.rename(columns={X_latest.index[-1]: "latest"}))
+    st.subheader("Latest feature snapshot")
+    st.dataframe(X_latest.T.rename(columns={X_latest.index[-1]: "Latest"}))
 
-    with st.expander("📈  Feature engineering & target definition"):
+    with st.expander("Feature engineering & target definition"):
         st.markdown(
-            "* **term_spread**  = 10 y Treasury minus 3 m T‑bill.\n"
-            "* **credit_spread**  = Baa ‑ Aaa corporate yield spread.\n"
-            "* **sahm_rule**  = Unemployment rate less its 12‑m low.\n"
-            "* **vix**  = CBOE volatility index.\n"
-            "* Momentum terms are 6‑month changes.  Each level & change is z‑scored.\n"
-            "* **target** = 1 if either condition holds in the next 12 m: NBER recession starts, or real S&P 500 draw‑down ≤ −20 %."
+            "* **term_spread** = 10‑y − 3‑m Treasury.\n"
+            "* **credit_spread** = Baa − Aaa IG yield.\n"
+            "* **sahm_rule** = U‑rate minus 12‑m low.\n"
+            "* **lei_6m_pct** = 6‑month %Δ Philly Fed Leading Index.\n"
+            "* **nfci / an_fci** = Chicago Fed financial‑conditions.\n"
+            "* **ism_spread** = ISM New Orders − Inventories.\n"
+            "* Each level and 6‑month change is z‑scored via expanding‑window mean/std to prevent look‑ahead.\n"
+            "* **Target** = 1 if within next 12 m an NBER recession starts *or* real S&P draw‑down ≤ −20 %."
         )
 
-    st.subheader("Next steps")
+    st.subheader("Next steps ➜")
     st.markdown(
-        "‑ Swap **LogisticRegression** for **XGBoostClassifier** to capture non‑linearities.\n"
-        "‑ Schedule job via **GitHub Actions** or **Dagster** to refresh monthly & send Slack/email alerts when probability > 0.45.\n"
-        "‑ Add additional macro factors (LEI, NFCI, ISM New Orders) – simply extend `FRED_SERIES` and adjust engineering.\n"
+        "‑ Wire a GitHub Actions workflow to refresh monthly and warn when probability > 0.45.\n"
+        "‑ Back‑test a regime‑switching 60/40 vs. defensive tilt using this ensemble.\n"
+        "‑ Experiment with SHAP values for the XGBoost model to see which variables drive changes over time."
     )
 
 
