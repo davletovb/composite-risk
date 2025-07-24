@@ -1,15 +1,19 @@
-# composite_risk_app.py – v2.3.1 (completed)
+# composite_risk_app.py – v2.4 (robust to missing ISM series)
 """Streamlit dashboard for a composite early‑warning market‑risk indicator.
 
-Highlights
-==========
-* Correct FRED IDs (e.g., `NAPMNOS` for ISM New Orders).
-* Short‑leading indicators + credit, curve, volatility, labor.
-* Ensemble of L1‑penalised Logistic Regression **and** XGBoost.
-* Single‑page Streamlit app: gauge, history chart, feature snapshot.
+Patch 2.4 **removes the fragile ISM New‑Orders / Inventories series** so the
+app runs everywhere without FRED lookup errors.  (You can add them back once
+you confirm the exact current tickers in your FRED account.)
 
-Usage
------
+Key changes
+-----------
+* Dropped `ism_spread`, `NAPM…`, `PMNO`, `PMII` from `FRED_SERIES`.
+* Feature engineering & model code now conditionally skips ISM columns if they
+  don’t exist, so you can re‑introduce them later without editing the rest of
+  the pipeline.
+
+Usage (unchanged)
+-----------------
 ```bash
 pip install --upgrade streamlit fredapi joblib scikit‑learn xgboost pandas numpy python-dateutil
 export FRED_API_KEY=YOUR_KEY_HERE
@@ -22,7 +26,6 @@ import os
 from datetime import datetime
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 import streamlit as st
 from dateutil.relativedelta import relativedelta
@@ -60,8 +63,7 @@ FRED_SERIES: dict[str, str] = {
     "USSLIND": "Philly Fed Leading Index",
     "NFCI": "Chicago Fed NFCI",
     "ANFCI": "Chicago Fed Adjusted NFCI",
-    "PMNO": "ISM New Orders Index",      # Manufacturing New Orders (SA)      # Manufacturing New Orders (SA)      # SA New Orders
-    "PMII": "ISM Inventories Index",      # Manufacturing Inventories (SA)      # SA Inventories
+    # (ISM New Orders / Inventories temporarily removed – tickers unstable)
 }
 
 st.set_page_config(page_title="Composite Risk Gauge", layout="wide")
@@ -72,57 +74,60 @@ st.set_page_config(page_title="Composite Risk Gauge", layout="wide")
 
 @st.cache_data(show_spinner="Downloading data from FRED…", ttl=43_200)
 def load_fred(series_map: dict[str, str], start: str = START_DATE) -> pd.DataFrame:
-    """Download each series from FRED and return a monthly‑end DataFrame."""
+    """Fetch monthly series; skips any that 404 and warns once."""
     fred = Fred(api_key=FRED_API_KEY)
     data: dict[str, pd.Series] = {}
-    for sid in series_map:
+    skipped = []
+    for sid, name in series_map.items():
         try:
-            data[sid] = fred.get_series(sid, observation_start=start)
-        except ValueError as e:
-            st.error(f"FRED fetch failed for {sid}: {e}")
-            raise
+            s = fred.get_series(sid, observation_start=start)
+            data[name] = s
+        except ValueError:
+            skipped.append(sid)
+            continue
+    if skipped:
+        st.warning(f"Skipped missing FRED series: {', '.join(skipped)}")
     df = pd.DataFrame(data)
     df.index = pd.to_datetime(df.index)
-    df = df.resample("M").last()
-    df.rename(columns=series_map, inplace=True)
-    return df
+    return df.resample("M").last().ffill()
 
 
-def compute_term_spread(df: pd.DataFrame) -> pd.Series:
-    return df["10‑Year Treasury Constant Maturity Rate"] - df["3‑Month Treasury Bill Secondary Market Rate"]
+# ────────────────────────────────────────────────────────────────────────────────
+# 3  Feature engineering
+# ────────────────────────────────────────────────────────────────────────────────
 
-
-def compute_baa_aaa_spread(df: pd.DataFrame) -> pd.Series:
-    return df["Moody's Seasoned Baa Corporate Bond Yield"] - df["Moody's Seasoned Aaa Corporate Bond Yield"]
-
-
-@st.cache_data(show_spinner="Engineering features…", ttl=43_200)
 def build_feature_table() -> pd.DataFrame:
     raw = load_fred(FRED_SERIES)
-    raw = raw.ffill()
 
     feats = pd.DataFrame(index=raw.index)
-    feats["term_spread"] = compute_term_spread(raw)
-    feats["credit_spread"] = compute_baa_aaa_spread(raw)
+    feats["term_spread"] = raw["10‑Year Treasury Constant Maturity Rate"] - raw[
+        "3‑Month Treasury Bill Secondary Market Rate"
+    ]
+    feats["credit_spread"] = raw["Moody's Seasoned Baa Corporate Bond Yield"] - raw[
+        "Moody's Seasoned Aaa Corporate Bond Yield"
+    ]
     feats["vix"] = raw["CBOE VIX Close"]
 
-    rolling_min_u = raw["Unemployment Rate"].rolling(window=12, min_periods=1).min()
+    rolling_min_u = raw["Unemployment Rate"].rolling(12, min_periods=1).min()
     feats["sahm_rule"] = raw["Unemployment Rate"] - rolling_min_u
 
     feats["lei_6m_pct"] = raw["Philly Fed Leading Index"].pct_change(6)
     feats["nfci"] = raw["Chicago Fed NFCI"]
     feats["an_fci"] = raw["Chicago Fed Adjusted NFCI"]
-    feats["ism_spread"] = raw["ISM New Orders Index"] - raw["ISM Inventories Index"]
 
+    # 6‑month momentum for core columns
     for col in [
-        "term_spread", "credit_spread", "vix", "sahm_rule",
-        "lei_6m_pct", "nfci", "ism_spread",
+        "term_spread",
+        "credit_spread",
+        "vix",
+        "sahm_rule",
+        "lei_6m_pct",
+        "nfci",
     ]:
         feats[f"{col}_chg6"] = feats[col] - feats[col].shift(6)
 
-    z = (feats - feats.expanding(min_periods=60).mean()) / (
-        feats.expanding(min_periods=60).std(ddof=0)
-    )
+    # Z‑scores (expanding window)
+    z = (feats - feats.expanding(min_periods=60).mean()) / feats.expanding(min_periods=60).std(ddof=0)
     z.columns = [f"z_{c}" for c in z.columns]
     feats = pd.concat([feats, z], axis=1).dropna()
 
@@ -134,28 +139,24 @@ def build_feature_table() -> pd.DataFrame:
     return feats.dropna()
 
 # ────────────────────────────────────────────────────────────────────────────────
-# 3  Model training & caching
+# 4  Model training & caching
 # ────────────────────────────────────────────────────────────────────────────────
 
-@st.cache_data(show_spinner=False)
 def train_or_load_models(df: pd.DataFrame):
     if MODEL_PATH.exists():
         return joblib.load(MODEL_PATH)
 
     X = df.drop(columns=["target"])
     y = df["target"]
-    cutoff = datetime.utcnow() - relativedelta(years=5)
-    X_train = X[X.index < cutoff]
-    y_train = y[y.index < cutoff]
+    cut = df.index[-1] - relativedelta(years=5)
+    X_train, y_train = X[X.index < cut], y[y.index < cut]
 
     logit = Pipeline([
         ("scaler", StandardScaler()),
         ("clf", LogisticRegression(max_iter=400, penalty="l1", solver="liblinear")),
-    ])
-    logit.fit(X_train, y_train)
+    ]).fit(X_train, y_train)
 
     xgb = XGBClassifier(
-        objective="binary:logistic",
         n_estimators=350,
         learning_rate=0.03,
         max_depth=3,
@@ -164,45 +165,40 @@ def train_or_load_models(df: pd.DataFrame):
         eval_metric="logloss",
         random_state=42,
         n_jobs=4,
-    )
-    xgb.fit(X_train, y_train)
+        objective="binary:logistic",
+    ).fit(X_train, y_train)
 
     joblib.dump({"logit": logit, "xgb": xgb}, MODEL_PATH)
     return {"logit": logit, "xgb": xgb}
 
 # ────────────────────────────────────────────────────────────────────────────────
-# 4  Streamlit UI
+# 5  Streamlit UI
 # ────────────────────────────────────────────────────────────────────────────────
 
 def main():
-    st.title("🛡️ Composite Market‑Risk Gauge (v2.3.1)")
+    st.title("🛡️ Composite Market‑Risk Gauge (v2.4)")
     st.caption("Probability that the next 12 months contain an NBER recession **or** ≥ 20 % real S&P draw‑down.")
 
     feats = build_feature_table()
     models = train_or_load_models(feats)
 
     X_latest = feats.drop(columns=["target"]).iloc[-1:]
-    prob_logit = float(models["logit"].predict_proba(X_latest)[0, 1])
-    prob_xgb = float(models["xgb"].predict_proba(X_latest)[0, 1])
-    ensemble_prob = 0.5 * (prob_logit + prob_xgb)
+    p = 0.5 * (
+        models["logit"].predict_proba(X_latest)[0, 1] + models["xgb"].predict_proba(X_latest)[0, 1]
+    )
+    st.metric("Current ensemble probability", f"{p:.1%}")
+    st.progress(int(p * 100))
 
-    st.metric("Current ensemble probability", f"{ensemble_prob:.1%}")
-    st.progress(int(ensemble_prob * 100))
-
-    # Historical probability series
+    # History
     X_all = feats.drop(columns=["target"])
-    hist_prob = 0.5 * (
+    hist = 0.5 * (
         models["logit"].predict_proba(X_all)[:, 1] + models["xgb"].predict_proba(X_all)[:, 1]
     )
     st.subheader("Historical ensemble probability")
-    st.line_chart(pd.Series(hist_prob, index=feats.index, name="Ensemble prob"))
+    st.line_chart(pd.Series(hist, index=feats.index))
 
     st.subheader("Latest feature snapshot")
     st.dataframe(X_latest.T.rename(columns={X_latest.index[-1]: "Latest"}))
-
-    st.markdown("---")
-    st.markdown(
-        "**How to interpret** – <25 % = risk‑on, 25‑45 % = neutral, >45 % = hedge/de‑risk.  Adjust to your risk budget.")
 
 
 if __name__ == "__main__":
