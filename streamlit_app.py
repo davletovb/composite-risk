@@ -60,7 +60,7 @@ FRED_SERIES: dict[str, str] = {
     "USSLIND": "Philly Fed Leading Index",
     "NFCI": "Chicago Fed NFCI",
     "ANFCI": "Chicago Fed Adjusted NFCI",
-    "NAPMNOS": "ISM New Orders Index",      # SA New Orders
+    "NAPMNOI": "ISM New Orders Index",      # Manufacturing New Orders (SA)      # SA New Orders
     "NAPMII": "ISM Inventories Index",      # SA Inventories
 }
 
