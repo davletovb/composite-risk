@@ -60,8 +60,8 @@ FRED_SERIES: dict[str, str] = {
     "USSLIND": "Philly Fed Leading Index",
     "NFCI": "Chicago Fed NFCI",
     "ANFCI": "Chicago Fed Adjusted NFCI",
-    "NAPMNOI": "ISM New Orders Index",      # Manufacturing New Orders (SA)      # SA New Orders
-    "NAPMII": "ISM Inventories Index",      # SA Inventories
+    "PMNO": "ISM New Orders Index",      # Manufacturing New Orders (SA)      # Manufacturing New Orders (SA)      # SA New Orders
+    "PMII": "ISM Inventories Index",      # Manufacturing Inventories (SA)      # SA Inventories
 }
 
 st.set_page_config(page_title="Composite Risk Gauge", layout="wide")
