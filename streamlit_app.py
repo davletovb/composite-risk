@@ -53,7 +53,7 @@ def build_models(X,y,names):
     m={}
     if "Logit" in names:m["Logit"]=Pipeline([("std",StandardScaler()),("clf",LogisticRegression(max_iter=600,solver="liblinear",penalty="l1"))]).fit(X,y)
     if "Random Forest" in names:m["Random Forest"]=RandomForestClassifier(400,max_depth=6,random_state=42).fit(X,y)
-    if "Gradient Boosting" in names:m["Gradient Boosting"]=GradientBoostingClassifier(400,0.05,3,random_state=42).fit(X,y)
+    if "Gradient Boosting" in names:m["Gradient Boosting"]=GradientBoostingClassifier(n_estimators=400, learning_rate=0.05, max_depth=3, random_state=42).fit(X,y)
     if "XGBoost" in names:m["XGBoost"]=XGBClassifier(n_estimators=400,learning_rate=0.03,max_depth=3,subsample=0.8,colsample_bytree=0.8,eval_metric="logloss",random_state=42).fit(X,y)
     if LGBMClassifier and "LightGBM" in names:m["LightGBM"]=LGBMClassifier(n_estimators=400,learning_rate=0.03,subsample=0.8,colsample_bytree=0.8).fit(X,y)
     if CatBoostClassifier and "CatBoost" in names:m["CatBoost"]=CatBoostClassifier(iterations=400,learning_rate=0.03,depth=4,loss_function="Logloss",verbose=False).fit(X,y)
