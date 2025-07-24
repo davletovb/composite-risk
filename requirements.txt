@@ -3,5 +3,8 @@ scikit-learn
 fredapi
 numpy
 pandas
+shap
 joblib
 xgboost
+lightgbm
+catboost
