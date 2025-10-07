@@ -5,7 +5,7 @@ Also squashes the pandas ‘M’ deprecation by switching to ‘ME’ resampling
 """
 from __future__ import annotations
 import os, numpy as np, pandas as pd, streamlit as st
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from fredapi import Fred
 from dateutil.relativedelta import relativedelta
@@ -21,6 +21,8 @@ try: from catboost import CatBoostClassifier
 except ImportError: CatBoostClassifier=None
 
 CACHE_DIR=Path(".cache");CACHE_DIR.mkdir(exist_ok=True)
+FRED_CACHE_FILE=CACHE_DIR/"fred_monthly.pkl"
+FRED_CACHE_MAX_AGE=timedelta(hours=12)
 FRED_API_KEY=os.getenv("FRED_API_KEY")
 START_DATE="1960-01-01"; DEFAULT_H=12
 FRED_SERIES={"DGS10":"10‑Year Treasury Constant Maturity Rate","TB3MS":"3‑Month Treasury Bill Secondary Market Rate","BAA":"Moody's Seasoned Baa Corporate Bond Yield","AAA":"Moody's Seasoned Aaa Corporate Bond Yield","UNRATE":"Unemployment Rate","VIXCLS":"CBOE VIX Close","USRECD":"NBER Recession Indicator","SP500":"S&P 500 Index (Daily Close)","USSLIND":"Philly Fed Leading Index","NFCI":"Chicago Fed NFCI","ANFCI":"Chicago Fed Adjusted NFCI"}
@@ -29,14 +31,31 @@ st.set_page_config(page_title="Composite Risk Gauge",layout="wide")
 
 # ⬇ Data helpers ----------------------------------------------------------------
 
-def load_fred():
+def _fetch_fred():
     fred=Fred(api_key=FRED_API_KEY)
     df=pd.DataFrame({n:fred.get_series(s,START_DATE) for s,n in FRED_SERIES.items()})
     df.index=pd.to_datetime(df.index)
-    # use month‑end ('ME') to silence future warning
     return df.resample("ME").last().ffill()
 
 
+@st.cache_data(show_spinner=False,ttl=int(FRED_CACHE_MAX_AGE.total_seconds()))
+def load_fred():
+    if FRED_CACHE_FILE.exists():
+        age=datetime.utcnow()-datetime.utcfromtimestamp(FRED_CACHE_FILE.stat().st_mtime)
+        if age<=FRED_CACHE_MAX_AGE:
+            return pd.read_pickle(FRED_CACHE_FILE)
+    try:
+        df=_fetch_fred()
+    except Exception as exc:
+        if FRED_CACHE_FILE.exists():
+            st.warning("Using cached FRED data due to fetch error.")
+            return pd.read_pickle(FRED_CACHE_FILE)
+        raise exc
+    df.to_pickle(FRED_CACHE_FILE)
+    return df
+
+
+@st.cache_data(show_spinner=False,ttl=int(FRED_CACHE_MAX_AGE.total_seconds()))
 def build_features(raw: pd.DataFrame, h: int):
     f=pd.DataFrame(index=raw.index)
     f["term_spread"]=raw[FRED_SERIES["DGS10"]]-raw[FRED_SERIES["TB3MS"]]
@@ -56,7 +75,9 @@ def build_features(raw: pd.DataFrame, h: int):
 
 # ⬇ Model helpers ----------------------------------------------------------------
 
+@st.cache_resource(show_spinner=False)
 def train_models(X,y,names):
+    names=tuple(names)
     m={}
     if "Logit" in names: m["Logit"]=Pipeline([("std",StandardScaler()),("clf",LogisticRegression(max_iter=600,solver="liblinear",penalty="l1"))]).fit(X,y)
     if "Random Forest" in names: m["Random Forest"]=RandomForestClassifier(400,max_depth=6,random_state=42).fit(X,y)
@@ -106,7 +127,9 @@ def main():
     base_models=["Logit","Random Forest","Gradient Boosting","XGBoost"]+(["LightGBM"] if LGBMClassifier else [])+(["CatBoost"] if CatBoostClassifier else [])
     model_sel=st.sidebar.selectbox("Model",base_models+["Ensemble"],index=len(base_models))
     models=train_models(Xtr,ytr,base_models if model_sel=="Ensemble" else [model_sel])
-    latest=X.iloc[[-1]]; p_now=get_prob(models,latest,model_sel)[0]
+    latest=X.iloc[[-1]]; prob_path=get_prob(models,X,model_sel); p_now=prob_path[-1]
+    prob_history=pd.Series(prob_path,index=df.index,name="prob")
+    cov_tr=Xtr.cov()
 
     st.title("🛡️ Composite Risk Gauge v4.3")
     st.metric("Current probability",f"{p_now:.1%}")
@@ -114,7 +137,7 @@ def main():
     tab_hist,tab_feat,tab_imp,tab_scen=st.tabs(["Probability history","Feature snapshot","Importance","Scenario Lab"])
 
     with tab_hist:
-        st.line_chart(pd.Series(get_prob(models,X,model_sel),index=df.index,name="prob"))
+        st.line_chart(prob_history)
     with tab_feat:
         st.dataframe(latest.T)
     with tab_imp:
@@ -135,7 +158,7 @@ def main():
             st.dataframe(shocked.T)
         elif mode=="Monte‑Carlo":
             n=st.number_input("Simulations",100,5000,1000)
-            sims=monte_carlo(latest.iloc[0],Xtr.cov(),int(n))
+            sims=monte_carlo(latest.iloc[0],cov_tr,int(n))
             p_mc=get_prob(models,sims,model_sel)
             st.write(f"5th‑95th pct: {np.percentile(p_mc,5):.1%} – {np.percentile(p_mc,95):.1%}")
             st.area_chart(pd.DataFrame({"probability":np.sort(p_mc)}).reset_index(drop=True))
